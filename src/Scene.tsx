@@ -3,7 +3,7 @@ import * as THREE from 'three'
 import { WebGPURenderer } from 'three/webgpu'
 import {
   Fn, instanceIndex, attributeArray, uniform,
-  float, vec3, cos, sin, sqrt, abs, clamp, fract,
+  float, vec3, cos, sin, sqrt, fract,
 } from 'three/tsl'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { Pane } from 'tweakpane'
@@ -34,33 +34,29 @@ function evalCoil(
   let px = R * cT, py = (t - 0.5) * L, pz = R * sT
   let nx = -cT, ny = 0, nz = -sT
   let bx = -L * sT / tMag, by = -R * omega / tMag, bz = L * cT / tMag
-  let dnx = omega * sT, dny = 0, dnz = -omega * cT
-  let dbx = -L * omega * cT / tMag, dby = 0, dbz = -L * omega * sT / tMag
   let dtx = -R * omega * sT, dty = L, dtz = R * omega * cT
 
   for (let lvl = 1; lvl <= maxLevel; lvl++) {
     const alpha = t * totals[lvl] * TAU
-    const ap = totals[lvl] * TAU
     const cA = Math.cos(alpha), sA = Math.sin(alpha)
     const off = offsets[lvl]
-    const ox = cA * nx + sA * bx, oy = cA * ny + sA * by, oz = cA * nz + sA * bz
-    px += off * ox; py += off * oy; pz += off * oz
-    const ddx = -ap * sA * nx + cA * dnx + ap * cA * bx + sA * dbx
-    const ddy = -ap * sA * ny + cA * dny + ap * cA * by + sA * dby
-    const ddz = -ap * sA * nz + cA * dnz + ap * cA * bz + sA * dbz
-    const dex = -ap * cA * nx - sA * dnx - ap * sA * bx + cA * dbx
-    const dey = -ap * cA * ny - sA * dny - ap * sA * by + cA * dby
-    const dez = -ap * cA * nz - sA * dnz - ap * sA * bz + cA * dbz
-    dtx += off * ddx; dty += off * ddy; dtz += off * ddz
+
+    const dx = cA * nx + sA * bx, dy = cA * ny + sA * by, dz = cA * nz + sA * bz
+    const ex = -sA * nx + cA * bx, ey = -sA * ny + cA * by, ez = -sA * nz + cA * bz
+
+    px += off * dx; py += off * dy; pz += off * dz
+
+    const w = off * totals[lvl] * TAU
+    dtx += w * ex; dty += w * ey; dtz += w * ez
+
     const tLen = Math.sqrt(dtx * dtx + dty * dty + dtz * dtz)
     const tx = dtx / tLen, ty = dty / tLen, tz = dtz / tLen
-    const dot = ox * tx + oy * ty + oz * tz
-    let nnx = ox - dot * tx, nny = oy - dot * ty, nnz = oz - dot * tz
+    const dot = dx * tx + dy * ty + dz * tz
+    let nnx = dx - dot * tx, nny = dy - dot * ty, nnz = dz - dot * tz
     const nLen = Math.sqrt(nnx * nnx + nny * nny + nnz * nnz)
     nnx /= nLen; nny /= nLen; nnz /= nLen
     nx = nnx; ny = nny; nz = nnz
     bx = ty * nnz - tz * nny; by = tz * nnx - tx * nnz; bz = tx * nny - ty * nnx
-    dnx = ddx; dny = ddy; dnz = ddz; dbx = dex; dby = dey; dbz = dez
   }
   outPos.x = px; outPos.y = py; outPos.z = pz
   if (outN) { outN.x = nx; outN.y = ny; outN.z = nz }
@@ -69,13 +65,13 @@ function evalCoil(
 
 // ── GPU compute: build evalCoil as TSL for a given max level ─────────────────
 function createCoilCompute(
-  maxLevel: number, totalTurns: number[], maxPts: number, colorCycles: number,
+  maxLevel: number, totalTurns: number[], maxPts: number,
   offUniforms: ReturnType<typeof uniform>[],
   tBaseU: ReturnType<typeof uniform>, tStepU: ReturnType<typeof uniform>,
   baseFracUniforms: ReturnType<typeof uniform>[],
   radiusU: ReturnType<typeof uniform>, lengthU: ReturnType<typeof uniform>,
   omegaU: ReturnType<typeof uniform>, tmagU: ReturnType<typeof uniform>,
-  posBuf: ReturnType<typeof attributeArray>, colBuf: ReturnType<typeof attributeArray>,
+  posBuf: ReturnType<typeof attributeArray>,
 ) {
   return Fn(() => {
     const idx = instanceIndex
@@ -99,80 +95,60 @@ function createCoilCompute(
     const by = radiusU.negate().mul(omegaU).div(tmagU).toVar('by')
     const bz = lengthU.mul(cT).div(tmagU).toVar('bz')
 
-    const dnx = omegaU.mul(sT).toVar('dnx')
-    const dny = float(0).toVar('dny')
-    const dnz = omegaU.negate().mul(cT).toVar('dnz')
-
-    const dbx = lengthU.negate().mul(omegaU).mul(cT).div(tmagU).toVar('dbx')
-    const dby = float(0).toVar('dby')
-    const dbz = lengthU.negate().mul(omegaU).mul(sT).div(tmagU).toVar('dbz')
-
+    // Un-normalized tangent (accumulated through levels for Gram-Schmidt)
     const dtx = radiusU.negate().mul(omegaU).mul(sT).toVar('dtx')
     const dty = lengthU.toVar('dty')
     const dtz = radiusU.mul(omegaU).mul(cT).toVar('dtz')
 
     for (let lvl = 1; lvl <= maxLevel; lvl++) {
-      // Per-level angle from f64-precise baseFrac + small f32 per-vertex offset
       const lvlFrac = baseFracUniforms[lvl].add(tStepU.mul(float(totalTurns[lvl])).mul(idx.toFloat()))
       const alpha = fract(lvlFrac).mul(float(TAU))
       const cA = cos(alpha), sA = sin(alpha)
       const off = offUniforms[lvl]
 
-      const ox = cA.mul(nx).add(sA.mul(bx)).toVar(`ox${lvl}`)
-      const oy = cA.mul(ny).add(sA.mul(by)).toVar(`oy${lvl}`)
-      const oz = cA.mul(nz).add(sA.mul(bz)).toVar(`oz${lvl}`)
+      // D = offset direction (rotated N), E = perpendicular (rotated B)
+      const dx = cA.mul(nx).add(sA.mul(bx)).toVar(`dx${lvl}`)
+      const dy = cA.mul(ny).add(sA.mul(by)).toVar(`dy${lvl}`)
+      const dz = cA.mul(nz).add(sA.mul(bz)).toVar(`dz${lvl}`)
+      const ex = sA.negate().mul(nx).add(cA.mul(bx)).toVar(`ex${lvl}`)
+      const ey = sA.negate().mul(ny).add(cA.mul(by)).toVar(`ey${lvl}`)
+      const ez = sA.negate().mul(nz).add(cA.mul(bz)).toVar(`ez${lvl}`)
 
-      px.addAssign(off.mul(ox))
-      py.addAssign(off.mul(oy))
-      pz.addAssign(off.mul(oz))
+      // Offset position
+      px.addAssign(off.mul(dx))
+      py.addAssign(off.mul(dy))
+      pz.addAssign(off.mul(dz))
 
-      const ap = float(totalTurns[lvl] * TAU)
-      const ddx = ap.negate().mul(sA).mul(nx).add(cA.mul(dnx)).add(ap.mul(cA).mul(bx)).add(sA.mul(dbx)).toVar(`ddx${lvl}`)
-      const ddy = ap.negate().mul(sA).mul(ny).add(cA.mul(dny)).add(ap.mul(cA).mul(by)).add(sA.mul(dby)).toVar(`ddy${lvl}`)
-      const ddz = ap.negate().mul(sA).mul(nz).add(cA.mul(dnz)).add(ap.mul(cA).mul(bz)).add(sA.mul(dbz)).toVar(`ddz${lvl}`)
+      // Accumulate tangent: T += off * angularRate * E
+      // angularRate = totals[k] * TAU, precomputed as f64 then baked to f32
+      const winding = off.mul(float(totalTurns[lvl] * TAU))
+      dtx.addAssign(winding.mul(ex))
+      dty.addAssign(winding.mul(ey))
+      dtz.addAssign(winding.mul(ez))
 
-      const dex = ap.negate().mul(cA).mul(nx).sub(sA.mul(dnx)).sub(ap.mul(sA).mul(bx)).add(cA.mul(dbx)).toVar(`dex${lvl}`)
-      const dey = ap.negate().mul(cA).mul(ny).sub(sA.mul(dny)).sub(ap.mul(sA).mul(by)).add(cA.mul(dby)).toVar(`dey${lvl}`)
-      const dez = ap.negate().mul(cA).mul(nz).sub(sA.mul(dnz)).sub(ap.mul(sA).mul(bz)).add(cA.mul(dbz)).toVar(`dez${lvl}`)
-
-      dtx.addAssign(off.mul(ddx))
-      dty.addAssign(off.mul(ddy))
-      dtz.addAssign(off.mul(ddz))
-
+      // Gram-Schmidt: project D perpendicular to tangent → N
       const tLen = sqrt(dtx.mul(dtx).add(dty.mul(dty)).add(dtz.mul(dtz)))
       const txn = dtx.div(tLen), tyn = dty.div(tLen), tzn = dtz.div(tLen)
-
-      const dot = ox.mul(txn).add(oy.mul(tyn)).add(oz.mul(tzn))
-      const nnx = ox.sub(dot.mul(txn)).toVar(`nnx${lvl}`)
-      const nny = oy.sub(dot.mul(tyn)).toVar(`nny${lvl}`)
-      const nnz = oz.sub(dot.mul(tzn)).toVar(`nnz${lvl}`)
+      const dot = dx.mul(txn).add(dy.mul(tyn)).add(dz.mul(tzn))
+      const nnx = dx.sub(dot.mul(txn)).toVar(`nnx${lvl}`)
+      const nny = dy.sub(dot.mul(tyn)).toVar(`nny${lvl}`)
+      const nnz = dz.sub(dot.mul(tzn)).toVar(`nnz${lvl}`)
       const nLen = sqrt(nnx.mul(nnx).add(nny.mul(nny)).add(nnz.mul(nnz)))
       nx.assign(nnx.div(nLen)); ny.assign(nny.div(nLen)); nz.assign(nnz.div(nLen))
 
+      // B = T × N
       bx.assign(tyn.mul(nz).sub(tzn.mul(ny)))
       by.assign(tzn.mul(nx).sub(txn.mul(nz)))
       bz.assign(txn.mul(ny).sub(tyn.mul(nx)))
-
-      dnx.assign(ddx); dny.assign(ddy); dnz.assign(ddz)
-      dbx.assign(dex); dby.assign(dey); dbz.assign(dez)
     }
 
     posBuf.element(idx).assign(vec3(px, py, pz))
-
-    // HSV(hue, 1, 1) → RGB
-    const hue = fract(t.mul(float(colorCycles)))
-    const h6 = hue.mul(6)
-    const r = clamp(abs(h6.sub(3)).sub(1), 0, 1)
-    const g = clamp(float(2).sub(abs(h6.sub(2))), 0, 1)
-    const b = clamp(float(2).sub(abs(h6.sub(4))), 0, 1)
-    colBuf.element(idx).assign(vec3(r, g, b))
   })().compute(maxPts)
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface LevelGPU {
   posBuf: ReturnType<typeof attributeArray>
-  colBuf: ReturnType<typeof attributeArray>
   compute: ReturnType<typeof createCoilCompute>
   line: THREE.Line
   maxPts: number
@@ -182,7 +158,7 @@ interface Runtime {
   renderer: WebGPURenderer; scene: THREE.Scene
   camera: THREE.PerspectiveCamera; controls: OrbitControls
   levels: LevelGPU[]
-  lineMaterial: THREE.LineBasicMaterial; pane: Pane
+  pane: Pane
 }
 
 export default function Scene() {
@@ -195,8 +171,12 @@ export default function Scene() {
     if (!canvas) return
     let disposed = false
 
+    const START_YEAR = -10000 // 10,000 BCE
+    const END_YEAR = 2100    // 2100 CE
+    const TOTAL_YEARS = END_YEAR - START_YEAR // 12,100
+    const CENTURY_TURNS = TOTAL_YEARS / 100   // 121
+
     const params = {
-      centuryTurns: 2,
       coilRadius: 1,
       turnSpacing: 10,
       offsets: [0, 0.1740, 0.0871, 0.0300, 0.0007, 0.0005, 0.0001],
@@ -214,27 +194,27 @@ export default function Scene() {
     // Per-level f64-precise fractional turns, computed on CPU
     const baseFracUniforms = HIERARCHY.map(() => uniform(0))
     const radiusU = uniform(params.coilRadius)
-    const lengthU = uniform(params.centuryTurns * params.turnSpacing)
-    const omegaU = uniform(params.centuryTurns * TAU)
+    const lengthU = uniform(CENTURY_TURNS * params.turnSpacing)
+    const omegaU = uniform(CENTURY_TURNS * TAU)
     const tmagU = uniform(1)
     const offUniforms = params.offsets.map(v => uniform(v))
 
     function syncHelixUniforms() {
-      const R = params.coilRadius, L = params.centuryTurns * params.turnSpacing
-      const omega = params.centuryTurns * TAU
+      const R = params.coilRadius, L = CENTURY_TURNS * params.turnSpacing
+      const omega = CENTURY_TURNS * TAU
       radiusU.value = R; lengthU.value = L; omegaU.value = omega
       tmagU.value = Math.sqrt(R * R * omega * omega + L * L)
     }
 
     function getTotalTurns(): number[] {
-      const t = [params.centuryTurns]
+      const t = [CENTURY_TURNS]
       for (let i = 1; i < HIERARCHY.length; i++) t.push(t[i - 1] * HIERARCHY[i].turnsPerParent)
       return t
     }
 
     function getHelixConsts() {
-      const R = params.coilRadius, L = params.centuryTurns * params.turnSpacing
-      const omega = params.centuryTurns * TAU
+      const R = params.coilRadius, L = CENTURY_TURNS * params.turnSpacing
+      const omega = CENTURY_TURNS * TAU
       return { R, L, omega, tMag: Math.sqrt(R * R * omega * omega + L * L) }
     }
 
@@ -264,27 +244,28 @@ export default function Scene() {
       _rB.copy(nv).multiplyScalar(-s).addScaledVector(bv, c)
     }
 
-    // ── Setup GPU levels ──────────────────────────────────────────────────
-    function createLevels(scene: THREE.Scene, lineMaterial: THREE.LineBasicMaterial): LevelGPU[] {
+    // Level hues: evenly spaced around the color wheel
+    const LEVEL_HUES = [0, 0.08, 0.16, 0.33, 0.55, 0.72, 0.88]
+
+    function createLevels(scene: THREE.Scene): LevelGPU[] {
       syncHelixUniforms()
       const totals = getTotalTurns()
       return HIERARCHY.map((h, lvl) => {
         const maxPts = WINDOW * h.spt + 1
-        const colorCycles = lvl === 0 ? params.centuryTurns : totals[lvl - 1]
         const posBuf = attributeArray(new Float32Array(maxPts * 3), 'vec3')
-        const colBuf = attributeArray(new Float32Array(maxPts * 3), 'vec3')
         const compute = createCoilCompute(
-          lvl, totals, maxPts, colorCycles, offUniforms,
+          lvl, totals, maxPts, offUniforms,
           tBaseU, tStepU, baseFracUniforms, radiusU, lengthU, omegaU, tmagU,
-          posBuf, colBuf,
+          posBuf,
         )
+        const col = new THREE.Color().setHSL(LEVEL_HUES[lvl], 1, 0.5)
+        const mat = new THREE.LineBasicMaterial({ color: col })
         const geom = new THREE.BufferGeometry()
         geom.setAttribute('position', posBuf.value)
-        geom.setAttribute('color', colBuf.value)
-        const line = new THREE.Line(geom, lineMaterial)
+        const line = new THREE.Line(geom, mat)
         line.frustumCulled = false
         scene.add(line)
-        return { posBuf, colBuf, compute, line, maxPts }
+        return { posBuf, compute, line, maxPts }
       })
     }
 
@@ -304,9 +285,13 @@ export default function Scene() {
         const tStep = w.tR / (maxPts - 1)           // f64
         tBaseU.value = tBase
         tStepU.value = tStep
-        // Compute f64-precise fractional turns for ALL levels
-        for (let k = 0; k < totals.length; k++) {
-          baseFracUniforms[k].value = (tBase * totals[k]) % 1
+        // Cascade fractional turns in f64 — keeps intermediate values small
+        // so we don't lose precision multiplying tBase by huge totals
+        let f = tBase * CENTURY_TURNS
+        baseFracUniforms[0].value = f % 1
+        for (let k = 1; k < totals.length; k++) {
+          f = (f % 1) * HIERARCHY[k].turnsPerParent
+          baseFracUniforms[k].value = f % 1
         }
         rt.renderer.compute(rt.levels[i].compute)
       }
@@ -330,7 +315,7 @@ export default function Scene() {
 
     function fullRebuild(rt: Runtime) {
       disposeLevels(rt)
-      rt.levels = createLevels(rt.scene, rt.lineMaterial)
+      rt.levels = createLevels(rt.scene)
       dispatchCompute(rt)
     }
 
@@ -360,13 +345,13 @@ export default function Scene() {
       scene.add(new THREE.DirectionalLight(0xffffff, 2).translateX(3).translateY(5).translateZ(4))
       scene.add(new THREE.AmbientLight(0xffffff, 0.3))
 
-      const lineMaterial = new THREE.LineBasicMaterial({ vertexColors: true })
+
       const pane = new Pane({ title: 'Coilendar' })
 
-      const rt: Runtime = { renderer, scene, camera, controls, levels: [], lineMaterial, pane }
+      const rt: Runtime = { renderer, scene, camera, controls, levels: [], pane }
       runtimeRef.current = rt
 
-      rt.levels = createLevels(scene, lineMaterial)
+      rt.levels = createLevels(scene)
       dispatchCompute(rt)
 
       cameraFrame(params.focusT)
@@ -391,8 +376,7 @@ export default function Scene() {
       canvas.addEventListener('contextmenu', (e) => e.preventDefault())
 
       // Structural params → full rebuild (recompiles shaders with new totalTurns)
-      pane.addBinding(params, 'centuryTurns', { min: 1, max: 20, step: 1, label: 'centuries' })
-        .on('change', () => { fullRebuild(rt); cameraFrame(params.focusT); const pp = new THREE.Vector3(_pos.x, _pos.y, _pos.z); rt.controls.target.copy(pp) })
+      // Century turns fixed by START_YEAR/END_YEAR (121 turns for 10000 BCE–2100 CE)
       pane.addBinding(params, 'coilRadius', { min: 0.1, max: 5, step: 0.1, label: 'coil radius' })
         .on('change', () => { syncHelixUniforms(); dispatchCompute(rt) })
       pane.addBinding(params, 'turnSpacing', { min: 0.1, max: 20, step: 0.1, label: 'turn spacing' })
@@ -401,7 +385,13 @@ export default function Scene() {
       const names = ['century', 'decade', 'year', 'day', 'hour', 'min', 'sec']
       for (let i = 1; i < params.offsets.length; i++) {
         const idx = i
-        pane.addBinding(params.offsets, idx as unknown as keyof typeof params.offsets, { min: 0.0001, max: i < 3 ? 2 : 0.5, step: 0.0001, label: names[idx] + ' off' })
+        const isLast = i === 6
+        pane.addBinding(params.offsets, idx as unknown as keyof typeof params.offsets, {
+          min: isLast ? 0.000001 : 0.0001,
+          max: i < 3 ? 2 : 0.5,
+          step: isLast ? 0.000001 : 0.0001,
+          label: names[idx] + ' off',
+        })
           .on('change', () => { offUniforms[idx].value = params.offsets[idx]; dispatchCompute(rt) })
       }
       pane.addBinding(params, 'panSpeed', { min: 1, max: 3600, step: 1, label: 'sec/pixel' })
@@ -427,7 +417,7 @@ export default function Scene() {
       disposed = true; window.removeEventListener('resize', handleResize)
       cancelAnimationFrame(rafRef.current)
       const rt = runtimeRef.current
-      if (rt) { rt.pane.dispose(); rt.controls.dispose(); disposeLevels(rt); rt.lineMaterial.dispose(); rt.renderer.dispose(); runtimeRef.current = null }
+      if (rt) { rt.pane.dispose(); rt.controls.dispose(); disposeLevels(rt); rt.renderer.dispose(); runtimeRef.current = null }
     }
   }, [])
 
