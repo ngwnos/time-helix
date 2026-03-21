@@ -10,6 +10,11 @@ const DAYS_PER_YEAR = 365
 const DAY_SEGS_PER_TURN = 12
 const HOURS_PER_DAY = 24
 const HOUR_SEGS_PER_TURN = 8
+const MINS_PER_HOUR = 60
+const MIN_SEGS_PER_TURN = 8
+const SECS_PER_MIN = 60
+const SEC_SEGS_PER_TURN = 32
+const SEC_WINDOW = 120 // ±60 seconds shown
 
 const paletteColors = [
   new THREE.Color('#e63946'),
@@ -88,6 +93,10 @@ interface Runtime {
   coilMesh: THREE.Mesh | null
   dayCoilLine: THREE.Line | null
   hourCoilLine: THREE.Line | null
+  minCoilLine: THREE.Line | null
+  secCoilLine: THREE.Line | null
+  minPosData: Float32Array | null
+  totalMinSegs: number
   material: MeshStandardNodeMaterial
   lineMaterial: THREE.LineBasicMaterial
   pane: Pane
@@ -111,12 +120,81 @@ export default function Scene() {
       turnSpacing: 5,
       outerOffset: 0.05,
       hourOffset: 0.01,
+      minOffset: 0.003,
+      secOffset: 0.0003,
+      panSpeed: 10,
+      focusT: 0.5,
+    }
+
+    // Compute helix position + Frenet frame at parameter t
+    const _helixPos = new THREE.Vector3()
+    const _helixN = new THREE.Vector3()
+    const _helixB = new THREE.Vector3()
+    const _helixT = new THREE.Vector3()
+
+    function helixFrame(t: number) {
+      const numTurns = Math.max(1, params.turns)
+      const R = params.coilRadius
+      const L = numTurns * params.turnSpacing
+      const omega = numTurns * Math.PI * 2
+      const theta = t * omega
+      const cT = Math.cos(theta), sT = Math.sin(theta)
+
+      _helixPos.set(cT * R, (t - 0.5) * L, sT * R)
+      _helixN.set(-cT, 0, -sT) // toward axis
+      const tMag = Math.sqrt(R * R * omega * omega + L * L)
+      _helixT.set(-sT * R * omega / tMag, L / tMag, cT * R * omega / tMag)
+      _helixB.crossVectors(_helixT, _helixN)
+    }
+
+    let prevFocusT = params.focusT
+    const _offset = new THREE.Vector3()
+
+    // Rotated frame: N and B rotated by the day-coil angle so the camera
+    // follows the day coil's winding around the tube.
+    const _rN = new THREE.Vector3()
+    const _rB = new THREE.Vector3()
+
+    function rotatedFrame(t: number) {
+      helixFrame(t)
+      const numTurns = Math.max(1, params.turns)
+      const totalDays = numTurns * DAYS_PER_YEAR
+      const dayAngle = t * totalDays * Math.PI * 2
+      const c = Math.cos(dayAngle), s = Math.sin(dayAngle)
+      // Rotate N,B around T by dayAngle
+      _rN.copy(_helixN).multiplyScalar(c).addScaledVector(_helixB, s)
+      _rB.copy(_helixN).multiplyScalar(-s).addScaledVector(_helixB, c)
+    }
+
+    function updateFocus(rt: Runtime) {
+      const oldT = prevFocusT
+      const newT = params.focusT
+      prevFocusT = newT
+
+      // Old frame: decompose camera offset into local coords
+      rotatedFrame(oldT)
+      _offset.copy(rt.camera.position).sub(_helixPos)
+      const lx = _offset.dot(_rN)
+      const ly = _offset.dot(_rB)
+      const lz = _offset.dot(_helixT)
+
+      // New frame: reconstruct camera position
+      rotatedFrame(newT)
+      rt.camera.position.copy(_helixPos)
+        .addScaledVector(_rN, lx)
+        .addScaledVector(_rB, ly)
+        .addScaledVector(_helixT, lz)
+
+      rt.controls.target.copy(_helixPos)
+
+      rebuildSecondCoil(rt)
     }
 
     function rebuild(rt: Runtime) {
       if (rt.coilMesh) { rt.scene.remove(rt.coilMesh); rt.coilMesh.geometry.dispose() }
       if (rt.dayCoilLine) { rt.scene.remove(rt.dayCoilLine); rt.dayCoilLine.geometry.dispose() }
       if (rt.hourCoilLine) { rt.scene.remove(rt.hourCoilLine); rt.hourCoilLine.geometry.dispose() }
+      if (rt.minCoilLine) { rt.scene.remove(rt.minCoilLine); rt.minCoilLine.geometry.dispose() }
 
       const numTurns = Math.max(1, params.turns)
       const length = numTurns * params.turnSpacing
@@ -238,6 +316,209 @@ export default function Scene() {
       hourGeom.setAttribute('color', new THREE.BufferAttribute(hourCol, 3))
       rt.hourCoilLine = new THREE.Line(hourGeom, rt.lineMaterial)
       rt.scene.add(rt.hourCoilLine)
+
+      // ====== MINUTE COIL (line) ======
+      const totalMinTurns = totalHourTurns * MINS_PER_HOUR
+      const totalMinSegs = totalMinTurns * MIN_SEGS_PER_TURN
+      const totalMinPts = totalMinSegs + 1
+
+      // Pass 1: hour-coil positions at minute resolution
+      // We need to recompute the full chain (helix → day → hour) at minute resolution.
+      // Day positions at minute resolution:
+      const dayMR = new Float32Array(totalMinPts * 3)
+      for (let i = 0; i < totalMinPts; i++) {
+        writeDayPos(i / totalMinSegs, omega, R, L, tMag, totalDayTurns, dayOff, dayMR, i * 3)
+      }
+
+      // Hour positions at minute resolution (parallel transport on day path):
+      const hourMR = new Float32Array(totalMinPts * 3)
+
+      curTan.set(dayMR[3] - dayMR[0], dayMR[4] - dayMR[1], dayMR[5] - dayMR[2]).normalize()
+      const ref2 = Math.abs(curTan.y) < 0.99 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0)
+      dN.crossVectors(ref2, curTan).normalize()
+      dB.crossVectors(curTan, dN)
+      prevTan.copy(curTan)
+
+      hourMR[0] = dayMR[0] + hOff * dN.x
+      hourMR[1] = dayMR[1] + hOff * dN.y
+      hourMR[2] = dayMR[2] + hOff * dN.z
+
+      for (let i = 1; i < totalMinPts; i++) {
+        const t = i / totalMinSegs
+        const pi = Math.max(0, i - 1) * 3
+        const ni = Math.min(totalMinPts - 1, i + 1) * 3
+        curTan.set(dayMR[ni] - dayMR[pi], dayMR[ni + 1] - dayMR[pi + 1], dayMR[ni + 2] - dayMR[pi + 2]).normalize()
+
+        crossV.crossVectors(prevTan, curTan)
+        const cl2 = crossV.length()
+        if (cl2 > 1e-10) {
+          crossV.divideScalar(cl2)
+          const ang2 = Math.acos(THREE.MathUtils.clamp(prevTan.dot(curTan), -1, 1))
+          dN.applyMatrix4(rotMat.makeRotationAxis(crossV, ang2))
+        }
+        dB.crossVectors(curTan, dN)
+        prevTan.copy(curTan)
+
+        const hA2 = t * totalHourTurns * Math.PI * 2
+        const cH2 = Math.cos(hA2), sH2 = Math.sin(hA2)
+        const j = i * 3
+        hourMR[j]     = dayMR[j]     + hOff * (cH2 * dN.x + sH2 * dB.x)
+        hourMR[j + 1] = dayMR[j + 1] + hOff * (cH2 * dN.y + sH2 * dB.y)
+        hourMR[j + 2] = dayMR[j + 2] + hOff * (cH2 * dN.z + sH2 * dB.z)
+      }
+
+      // Pass 2: parallel-transport frame along hour-coil path + minute offsets
+      const minPos = new Float32Array(totalMinPts * 3)
+      const minCol = new Float32Array(totalMinPts * 3)
+      const mOff = params.minOffset
+
+      curTan.set(hourMR[3] - hourMR[0], hourMR[4] - hourMR[1], hourMR[5] - hourMR[2]).normalize()
+      const ref3 = Math.abs(curTan.y) < 0.99 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0)
+      dN.crossVectors(ref3, curTan).normalize()
+      dB.crossVectors(curTan, dN)
+      prevTan.copy(curTan)
+
+      minPos[0] = hourMR[0] + mOff * dN.x
+      minPos[1] = hourMR[1] + mOff * dN.y
+      minPos[2] = hourMR[2] + mOff * dN.z
+      tmpColor.setHSL(0, 1, 0.5)
+      minCol[0] = tmpColor.r; minCol[1] = tmpColor.g; minCol[2] = tmpColor.b
+
+      for (let i = 1; i < totalMinPts; i++) {
+        const t = i / totalMinSegs
+        const pi = Math.max(0, i - 1) * 3
+        const ni = Math.min(totalMinPts - 1, i + 1) * 3
+        curTan.set(hourMR[ni] - hourMR[pi], hourMR[ni + 1] - hourMR[pi + 1], hourMR[ni + 2] - hourMR[pi + 2]).normalize()
+
+        crossV.crossVectors(prevTan, curTan)
+        const cl3 = crossV.length()
+        if (cl3 > 1e-10) {
+          crossV.divideScalar(cl3)
+          const ang3 = Math.acos(THREE.MathUtils.clamp(prevTan.dot(curTan), -1, 1))
+          dN.applyMatrix4(rotMat.makeRotationAxis(crossV, ang3))
+        }
+        dB.crossVectors(curTan, dN)
+        prevTan.copy(curTan)
+
+        const mA = t * totalMinTurns * Math.PI * 2
+        const cM = Math.cos(mA), sM = Math.sin(mA)
+        const j = i * 3
+        minPos[j]     = hourMR[j]     + mOff * (cM * dN.x + sM * dB.x)
+        minPos[j + 1] = hourMR[j + 1] + mOff * (cM * dN.y + sM * dB.y)
+        minPos[j + 2] = hourMR[j + 2] + mOff * (cM * dN.z + sM * dB.z)
+
+        // Hue cycles once per hour
+        const hourFrac = (t * totalHourTurns) % 1
+        tmpColor.setHSL(hourFrac, 1, 0.5)
+        minCol[j] = tmpColor.r; minCol[j + 1] = tmpColor.g; minCol[j + 2] = tmpColor.b
+      }
+
+      const minGeom = new THREE.BufferGeometry()
+      minGeom.setAttribute('position', new THREE.BufferAttribute(minPos, 3))
+      minGeom.setAttribute('color', new THREE.BufferAttribute(minCol, 3))
+      rt.minCoilLine = new THREE.Line(minGeom, rt.lineMaterial)
+      rt.scene.add(rt.minCoilLine)
+
+      // Store for second coil to sample from
+      rt.minPosData = minPos
+      rt.totalMinSegs = totalMinSegs
+
+      rebuildSecondCoil(rt)
+    }
+
+    function rebuildSecondCoil(rt: Runtime) {
+      if (rt.secCoilLine) { rt.scene.remove(rt.secCoilLine); rt.secCoilLine.geometry.dispose(); rt.secCoilLine = null }
+      if (!rt.minPosData || rt.totalMinSegs < 2) return
+
+      const numTurns = Math.max(1, params.turns)
+      const totalDayTurns = numTurns * DAYS_PER_YEAR
+      const totalHourTurns = totalDayTurns * HOURS_PER_DAY
+      const totalMinTurns = totalHourTurns * MINS_PER_HOUR
+      const totalSecTurns = totalMinTurns * SECS_PER_MIN
+      const sOff = params.secOffset
+
+      // Window: ±60 seconds centered on focusT
+      const halfT = (SEC_WINDOW / 2) / totalSecTurns
+      const tS = Math.max(0, params.focusT - halfT)
+      const tE = Math.min(1, params.focusT + halfT)
+      const tR = tE - tS
+      const secTurnsInWindow = tR * totalSecTurns
+      const totalSecSegs = Math.ceil(secTurnsInWindow * SEC_SEGS_PER_TURN)
+      const totalSecPts = totalSecSegs + 1
+      if (totalSecPts < 2) return
+
+      const tmpColor = new THREE.Color()
+      const prevTan = new THREE.Vector3()
+      const curTan = new THREE.Vector3()
+      const dN = new THREE.Vector3()
+      const dB = new THREE.Vector3()
+      const crossV = new THREE.Vector3()
+      const rotMat = new THREE.Matrix4()
+
+      // Sample the ACTUAL stored minute coil positions at second resolution
+      // by linearly interpolating from rt.minPosData
+      const minSR = new Float32Array(totalSecPts * 3)
+      const mp = rt.minPosData
+      const mSegs = rt.totalMinSegs
+
+      for (let i = 0; i < totalSecPts; i++) {
+        const t = tS + tR * i / (totalSecPts - 1)
+        const fi = t * mSegs // floating index into minPos
+        const i0 = Math.min(Math.floor(fi), mSegs)
+        const i1 = Math.min(i0 + 1, mSegs)
+        const frac = fi - i0
+        const a = i0 * 3, b = i1 * 3, j = i * 3
+        minSR[j]     = mp[a]     + frac * (mp[b]     - mp[a])
+        minSR[j + 1] = mp[a + 1] + frac * (mp[b + 1] - mp[a + 1])
+        minSR[j + 2] = mp[a + 2] + frac * (mp[b + 2] - mp[a + 2])
+      }
+
+      // Parallel transport on the sampled minute positions → wrap seconds
+      const secPos = new Float32Array(totalSecPts * 3)
+      const secCol = new Float32Array(totalSecPts * 3)
+
+      curTan.set(minSR[3] - minSR[0], minSR[4] - minSR[1], minSR[5] - minSR[2]).normalize()
+      const ref = Math.abs(curTan.y) < 0.99 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0)
+      dN.crossVectors(ref, curTan).normalize()
+      dB.crossVectors(curTan, dN)
+      prevTan.copy(curTan)
+
+      const sA0 = tS * totalSecTurns * Math.PI * 2
+      secPos[0] = minSR[0] + sOff * (Math.cos(sA0) * dN.x + Math.sin(sA0) * dB.x)
+      secPos[1] = minSR[1] + sOff * (Math.cos(sA0) * dN.y + Math.sin(sA0) * dB.y)
+      secPos[2] = minSR[2] + sOff * (Math.cos(sA0) * dN.z + Math.sin(sA0) * dB.z)
+      const minFrac0 = (tS * totalMinTurns) % 1
+      tmpColor.setHSL(minFrac0, 1, 0.5)
+      secCol[0] = tmpColor.r; secCol[1] = tmpColor.g; secCol[2] = tmpColor.b
+
+      for (let i = 1; i < totalSecPts; i++) {
+        const t = tS + tR * i / (totalSecPts - 1)
+        const pi = Math.max(0, i - 1) * 3
+        const ni = Math.min(totalSecPts - 1, i + 1) * 3
+        curTan.set(minSR[ni] - minSR[pi], minSR[ni + 1] - minSR[pi + 1], minSR[ni + 2] - minSR[pi + 2]).normalize()
+        crossV.crossVectors(prevTan, curTan)
+        const cl = crossV.length()
+        if (cl > 1e-10) { crossV.divideScalar(cl); dN.applyMatrix4(rotMat.makeRotationAxis(crossV, Math.acos(THREE.MathUtils.clamp(prevTan.dot(curTan), -1, 1)))) }
+        dB.crossVectors(curTan, dN)
+        prevTan.copy(curTan)
+
+        const sA = t * totalSecTurns * Math.PI * 2
+        const cS = Math.cos(sA), sS = Math.sin(sA)
+        const j = i * 3
+        secPos[j]     = minSR[j]     + sOff * (cS * dN.x + sS * dB.x)
+        secPos[j + 1] = minSR[j + 1] + sOff * (cS * dN.y + sS * dB.y)
+        secPos[j + 2] = minSR[j + 2] + sOff * (cS * dN.z + sS * dB.z)
+
+        const minFrac = (t * totalMinTurns) % 1
+        tmpColor.setHSL(minFrac, 1, 0.5)
+        secCol[j] = tmpColor.r; secCol[j + 1] = tmpColor.g; secCol[j + 2] = tmpColor.b
+      }
+
+      const secGeom = new THREE.BufferGeometry()
+      secGeom.setAttribute('position', new THREE.BufferAttribute(secPos, 3))
+      secGeom.setAttribute('color', new THREE.BufferAttribute(secCol, 3))
+      rt.secCoilLine = new THREE.Line(secGeom, rt.lineMaterial)
+      rt.scene.add(rt.secCoilLine)
     }
 
     const init = async () => {
@@ -271,12 +552,21 @@ export default function Scene() {
       const scene = new THREE.Scene()
       scene.background = new THREE.Color(0x111111)
 
-      const camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 100)
-      camera.position.set(3, 3, 5)
+      const camera = new THREE.PerspectiveCamera(60, width / height, 0.001, 200)
 
       const controls = new OrbitControls(camera, renderer.domElement)
       controls.enableDamping = true
       controls.dampingFactor = 0.08
+      controls.enablePan = false
+      controls.minDistance = params.tubeRadius
+
+      // Position camera relative to initial focus on helix
+      rotatedFrame(params.focusT)
+      controls.target.copy(_helixPos)
+      // Offset: outward from rotated normal + slight binormal
+      camera.position.copy(_helixPos)
+        .addScaledVector(_rN, -2)
+        .addScaledVector(_rB, 0.5)
 
       const dirLight = new THREE.DirectionalLight(0xffffff, 2)
       dirLight.position.set(3, 5, 4)
@@ -294,25 +584,64 @@ export default function Scene() {
 
       const rt: Runtime = {
         renderer, scene, camera, controls,
-        coilMesh: null, dayCoilLine: null, hourCoilLine: null,
+        coilMesh: null, dayCoilLine: null, hourCoilLine: null, minCoilLine: null, secCoilLine: null,
+        minPosData: null, totalMinSegs: 0,
         material, lineMaterial, pane,
       }
       runtimeRef.current = rt
 
       rebuild(rt)
+      updateFocus(rt)
+
+      // Right-click drag → slide focus along the helix
+      let dragging = false
+      let dragStartX = 0
+      let dragStartT = 0
+      let focusDragging = false
+      const focusBinding = pane.addBinding(params, 'focusT', { min: 0, max: 1, step: 0.0001, label: 'focus' })
+      focusBinding.on('change', () => { if (!focusDragging) updateFocus(rt) })
+
+      canvas.addEventListener('pointerdown', (e) => {
+        if (e.button === 2) {
+          dragging = true
+          focusDragging = true
+          dragStartX = e.clientX
+          dragStartT = params.focusT
+          e.preventDefault()
+        }
+      })
+      canvas.addEventListener('pointermove', (e) => {
+        if (!dragging) return
+        const dx = e.clientX - dragStartX
+        const numTurns = Math.max(1, params.turns)
+        const totalSecs = numTurns * DAYS_PER_YEAR * HOURS_PER_DAY * MINS_PER_HOUR * SECS_PER_MIN
+        const sensitivity = params.panSpeed / totalSecs
+        params.focusT = THREE.MathUtils.clamp(dragStartT - dx * sensitivity, 0, 1)
+        focusBinding.refresh()
+        updateFocus(rt)
+      })
+      const stopDrag = () => { dragging = false; focusDragging = false }
+      canvas.addEventListener('pointerup', stopDrag)
+      canvas.addEventListener('pointercancel', stopDrag)
+      canvas.addEventListener('contextmenu', (e) => e.preventDefault())
 
       pane.addBinding(params, 'turns', { min: 1, max: 20, step: 1 })
-        .on('change', () => rebuild(rt))
+        .on('change', () => { rebuild(rt); updateFocus(rt) })
       pane.addBinding(params, 'tubeRadius', { min: 0.01, max: 0.5, step: 0.01, label: 'tube radius' })
-        .on('change', () => rebuild(rt))
+        .on('change', () => { rebuild(rt); updateFocus(rt) })
       pane.addBinding(params, 'coilRadius', { min: 0.1, max: 5, step: 0.1, label: 'coil radius' })
-        .on('change', () => rebuild(rt))
+        .on('change', () => { rebuild(rt); updateFocus(rt) })
       pane.addBinding(params, 'turnSpacing', { min: 0.1, max: 5, step: 0.1, label: 'turn spacing' })
-        .on('change', () => rebuild(rt))
+        .on('change', () => { rebuild(rt); updateFocus(rt) })
       pane.addBinding(params, 'outerOffset', { min: 0.05, max: 1, step: 0.01, label: 'day offset' })
-        .on('change', () => rebuild(rt))
+        .on('change', () => { rebuild(rt); updateFocus(rt) })
       pane.addBinding(params, 'hourOffset', { min: 0.001, max: 0.1, step: 0.001, label: 'hour offset' })
-        .on('change', () => rebuild(rt))
+        .on('change', () => { rebuild(rt); updateFocus(rt) })
+      pane.addBinding(params, 'minOffset', { min: 0.0005, max: 0.05, step: 0.0005, label: 'min offset' })
+        .on('change', () => { rebuild(rt); updateFocus(rt) })
+      pane.addBinding(params, 'secOffset', { min: 0.0001, max: 0.01, step: 0.0001, label: 'sec offset' })
+        .on('change', () => rebuildSecondCoil(rt))
+      pane.addBinding(params, 'panSpeed', { min: 1, max: 3600, step: 1, label: 'sec/pixel' })
 
       const animate = () => {
         if (disposed) return
@@ -348,6 +677,8 @@ export default function Scene() {
         if (rt.coilMesh) rt.coilMesh.geometry.dispose()
         if (rt.dayCoilLine) rt.dayCoilLine.geometry.dispose()
         if (rt.hourCoilLine) rt.hourCoilLine.geometry.dispose()
+        if (rt.minCoilLine) rt.minCoilLine.geometry.dispose()
+        if (rt.secCoilLine) rt.secCoilLine.geometry.dispose()
         rt.material.dispose()
         rt.lineMaterial.dispose()
         rt.renderer.dispose()
