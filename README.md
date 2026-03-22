@@ -1,6 +1,6 @@
 # Time Helix
 
-Interactive fractal coil calendar. All of human history mapped onto a recursive helix — centuries contain decades, decades contain years, years contain days, and so on. Built with Three.js WebGPU.
+Interactive fractal coil calendar built with Three.js WebGPU.
 
 ## Controls
 

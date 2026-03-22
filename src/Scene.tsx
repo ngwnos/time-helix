@@ -352,6 +352,38 @@ export default function Scene() {
       return year < 0 ? `${-year} BCE` : year === 0 ? '1 BCE' : `${year} CE`
     }
 
+    function eventDateStr(t: number): string {
+      const fracYear = START_YEAR + t * TOTAL_YEARS
+      const year = Math.floor(fracYear)
+      const frac = fracYear - year
+      // No sub-year precision — just show the year
+      if (frac < 0.003) return yearLabel(year) // within ~1 day of Jan 1
+      const dayOfYear = frac * 365.25
+      const daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+      const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+      let rem = Math.floor(dayOfYear), m = 0
+      while (m < 11 && rem >= daysInMonth[m]) { rem -= daysInMonth[m]; m++ }
+      const fracDay = dayOfYear - Math.floor(dayOfYear)
+      // Has hour precision?
+      if (fracDay > 0.02) {
+        const hour = Math.floor(fracDay * 24)
+        return `${yearLabel(year)}, ${months[m]} ${rem + 1} ${hour}:00`
+      }
+      return `${yearLabel(year)}, ${months[m]} ${rem + 1}`
+    }
+
+    function relativeDateStr(t: number, focusT: number): string {
+      const dy = (t - focusT) * TOTAL_YEARS
+      const abs = Math.abs(dy)
+      const sign = dy < 0 ? '-' : '+'
+      if (abs < 1 / 8766) return 'now'
+      if (abs < 1 / 365.25) return `${sign}${(abs * 8766).toFixed(0)}h`
+      if (abs < 1) return `${sign}${(abs * 365.25).toFixed(0)}d`
+      if (abs < 100) return `${sign}${abs.toFixed(1)}y`
+      if (abs < 1000) return `${sign}${Math.round(abs)}y`
+      return `${sign}${(abs / 1000).toFixed(1)}ky`
+    }
+
     function dayLabel(fracYear: number): string {
       const dayOfYear = (fracYear - Math.floor(fracYear)) * 365.25
       const daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
@@ -433,7 +465,7 @@ export default function Scene() {
         return (1970 + ms / (365.25 * 24 * 3600 * 1000) - START_YEAR) / TOTAL_YEARS
       }
 
-      const events: CoilEvent[] = [
+      let events: CoilEvent[] = [
         // Prehistoric & early civilization
         { name: 'First cave paintings (Lascaux)', t: yearToT(-8000), level: 0, color: '#c0a060' },
         { name: 'Agriculture begins (Fertile Crescent)', t: yearToT(-9500), level: 0, color: '#6bcb77' },
@@ -562,7 +594,50 @@ export default function Scene() {
       ]
 
       // Pre-parsed event colors
-      const eventRGB = events.map(ev => { const c = new THREE.Color(ev.color); return [c.r, c.g, c.b] as const })
+      let eventRGB = events.map(ev => { const c = new THREE.Color(ev.color); return [c.r, c.g, c.b] as const })
+
+      const EVENT_SCHEMA = `{
+  "events": [
+    {
+      "name": "Event Name",
+      "year": 1969,
+      "date": "1969-07-20",
+      "level": 0,
+      "color": "#ff6b6b"
+    }
+  ]
+}
+
+Fields:
+- name (required): Display name
+- year OR date (required): Use "year" for year-only precision (e.g. -753), "date" for specific dates (e.g. "1969-07-20" or "-0044-03-15T13:00")
+- level (required): 0=century, 1=decade, 2=year, 3=day scale. Controls visibility range and coil placement.
+- color (required): Hex color string
+- tMin, tMax (optional): Uncertainty range as year or date, same format as year/date`
+
+      function parseEventJson(json: string): CoilEvent[] | string {
+        try {
+          const data = JSON.parse(json)
+          const arr = data.events || data
+          if (!Array.isArray(arr)) return 'Expected { "events": [...] } or an array'
+          const parsed: CoilEvent[] = []
+          for (const e of arr) {
+            if (!e.name || e.level == null || !e.color) return `Missing name/level/color on: ${JSON.stringify(e).slice(0, 60)}`
+            const t = e.date ? dateToT(String(e.date)) : e.year != null ? yearToT(e.year) : null
+            if (t == null) return `Missing year or date on: ${e.name}`
+            const ev: CoilEvent = { name: e.name, t, level: e.level, color: e.color }
+            if (e.tMin != null) ev.tMin = typeof e.tMin === 'string' ? dateToT(e.tMin) : yearToT(e.tMin)
+            if (e.tMax != null) ev.tMax = typeof e.tMax === 'string' ? dateToT(e.tMax) : yearToT(e.tMax)
+            parsed.push(ev)
+          }
+          return parsed
+        } catch (err) { return String(err) }
+      }
+
+      function setEvents(newEvents: CoilEvent[]) {
+        events = newEvents
+        eventRGB = events.map(ev => { const c = new THREE.Color(ev.color); return [c.r, c.g, c.b] as const })
+      }
 
       // ── DOM label pool ──────────────────────────────────────────────────
       const POOL_SIZE = 120
@@ -573,6 +648,11 @@ export default function Scene() {
         overlay.appendChild(div)
         labelPool.push(div)
       }
+
+      // Event connector canvas (dots on coil + lines to labels)
+      const connCanvas = document.createElement('canvas')
+      connCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none'
+      overlay.appendChild(connCanvas)
 
       // Fixed focus label + connecting line on the right side
       const focusChevron = document.createElement('div')
@@ -775,6 +855,89 @@ export default function Scene() {
         if (e.code === 'Space' && !e.repeat) { e.preventDefault(); playing = !playing; updatePlayBtn() }
       }
       window.addEventListener('keydown', onSpaceKey)
+
+      // ── Date mode toggle ─────────────────────────────────────────────────
+      let dateMode: 'absolute' | 'relative' = 'absolute'
+      const dateModeDiv = document.createElement('div')
+      dateModeDiv.style.cssText = 'margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #333'
+      const dateModeBtn = document.createElement('div')
+      dateModeBtn.style.cssText = 'text-align:center;padding:4px 8px;border-radius:3px;cursor:pointer;background:rgba(255,255,255,0.08);color:#ccc;font-size:11px;font-family:monospace;transition:background 0.15s;user-select:none'
+      dateModeBtn.addEventListener('click', (e) => { e.stopPropagation(); dateMode = dateMode === 'absolute' ? 'relative' : 'absolute'; dateModeBtn.textContent = dateMode === 'absolute' ? 'Dates: absolute' : 'Dates: relative' })
+      dateModeBtn.addEventListener('mouseenter', () => { dateModeBtn.style.background = 'rgba(255,255,255,0.2)' })
+      dateModeBtn.addEventListener('mouseleave', () => { dateModeBtn.style.background = 'rgba(255,255,255,0.08)' })
+      dateModeBtn.textContent = 'Dates: absolute'
+      dateModeDiv.appendChild(dateModeBtn)
+      levelPanel.appendChild(dateModeDiv)
+
+      // ── Custom events ────────────────────────────────────────────────────
+      const customDiv = document.createElement('div')
+      customDiv.style.cssText = 'margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #333'
+      const customBtnRow = document.createElement('div')
+      customBtnRow.style.cssText = 'display:flex;gap:4px'
+      const customToggleBtn = document.createElement('div')
+      customToggleBtn.textContent = 'Custom events'
+      customToggleBtn.style.cssText = 'flex:1;text-align:center;padding:4px 8px;border-radius:3px;cursor:pointer;background:rgba(255,255,255,0.08);color:#ccc;font-size:11px;font-family:monospace;transition:background 0.15s;user-select:none'
+      customToggleBtn.addEventListener('mouseenter', () => { customToggleBtn.style.background = 'rgba(255,255,255,0.2)' })
+      customToggleBtn.addEventListener('mouseleave', () => { customToggleBtn.style.background = 'rgba(255,255,255,0.08)' })
+      const copySchemaBtn = document.createElement('div')
+      copySchemaBtn.textContent = 'Schema'
+      copySchemaBtn.style.cssText = 'padding:4px 8px;border-radius:3px;cursor:pointer;background:rgba(255,255,255,0.08);color:#888;font-size:11px;font-family:monospace;transition:background 0.15s;user-select:none;min-width:52px;text-align:center'
+      copySchemaBtn.addEventListener('mouseenter', () => { copySchemaBtn.style.background = 'rgba(255,255,255,0.2)' })
+      copySchemaBtn.addEventListener('mouseleave', () => { copySchemaBtn.style.background = 'rgba(255,255,255,0.08)' })
+      // Set fixed width from initial content before any text changes
+      requestAnimationFrame(() => { copySchemaBtn.style.width = `${copySchemaBtn.offsetWidth}px` })
+      copySchemaBtn.addEventListener('click', (e) => {
+        e.stopPropagation()
+        navigator.clipboard.writeText(EVENT_SCHEMA).then(() => {
+          copySchemaBtn.textContent = 'Copied!'
+          setTimeout(() => { copySchemaBtn.textContent = 'Schema' }, 1500)
+        })
+      })
+      customBtnRow.appendChild(customToggleBtn)
+      customBtnRow.appendChild(copySchemaBtn)
+      customDiv.appendChild(customBtnRow)
+
+      const customPane = document.createElement('div')
+      customPane.style.cssText = 'display:none;margin-top:6px'
+      const customTextarea = document.createElement('textarea')
+      customTextarea.style.cssText = 'width:100%;height:120px;background:rgba(0,0,0,0.4);border:1px solid #555;border-radius:3px;color:#ccc;font-family:monospace;font-size:10px;padding:4px;resize:vertical;box-sizing:border-box'
+      customTextarea.placeholder = 'Paste event JSON here...'
+      const customSubmitRow = document.createElement('div')
+      customSubmitRow.style.cssText = 'display:flex;gap:4px;margin-top:4px'
+      const submitBtnStyle = 'flex:1;text-align:center;padding:4px 8px;border-radius:3px;cursor:pointer;font-size:11px;font-family:monospace;transition:background 0.15s;user-select:none'
+      const addEventsBtn = document.createElement('div')
+      addEventsBtn.textContent = 'Add'
+      addEventsBtn.style.cssText = submitBtnStyle + ';background:rgba(100,200,100,0.15);color:#6bcb77'
+      addEventsBtn.addEventListener('mouseenter', () => { addEventsBtn.style.background = 'rgba(100,200,100,0.3)' })
+      addEventsBtn.addEventListener('mouseleave', () => { addEventsBtn.style.background = 'rgba(100,200,100,0.15)' })
+      const replaceEventsBtn = document.createElement('div')
+      replaceEventsBtn.textContent = 'Replace'
+      replaceEventsBtn.style.cssText = submitBtnStyle + ';background:rgba(200,100,100,0.15);color:#e74c3c'
+      replaceEventsBtn.addEventListener('mouseenter', () => { replaceEventsBtn.style.background = 'rgba(200,100,100,0.3)' })
+      replaceEventsBtn.addEventListener('mouseleave', () => { replaceEventsBtn.style.background = 'rgba(200,100,100,0.15)' })
+      const customStatus = document.createElement('div')
+      customStatus.style.cssText = 'font-size:10px;color:#e74c3c;margin-top:4px;display:none'
+      function handleCustomSubmit(replace: boolean) {
+        const result = parseEventJson(customTextarea.value)
+        if (typeof result === 'string') { customStatus.textContent = result; customStatus.style.display = 'block'; return }
+        setEvents(replace ? result : [...events, ...result])
+        customStatus.style.display = 'none'; customPane.style.display = 'none'
+        customToggleBtn.textContent = `Custom events (${events.length})`
+      }
+      addEventsBtn.addEventListener('click', (e) => { e.stopPropagation(); handleCustomSubmit(false) })
+      replaceEventsBtn.addEventListener('click', (e) => { e.stopPropagation(); handleCustomSubmit(true) })
+      customSubmitRow.appendChild(addEventsBtn)
+      customSubmitRow.appendChild(replaceEventsBtn)
+      customPane.appendChild(customTextarea)
+      customPane.appendChild(customSubmitRow)
+      customPane.appendChild(customStatus)
+      customDiv.appendChild(customPane)
+      levelPanel.appendChild(customDiv)
+
+      customToggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation()
+        customPane.style.display = customPane.style.display === 'none' ? 'block' : 'none'
+      })
 
       const panelTitle = document.createElement('div')
       panelTitle.textContent = 'Camera Level'
@@ -1094,7 +1257,7 @@ export default function Scene() {
         let markerIdx = 0
 
         // ── Events (always write line segments; collect labels for de-overlap) ─
-        const eventLabels: { scrX: number; scrY: number; opacity: number; ev: CoilEvent; anchorY: number; right: boolean }[] = []
+        const eventLabels: { scrX: number; scrY: number; coilX: number; coilY: number; opacity: number; ev: CoilEvent; anchorY: number; right: boolean }[] = []
         for (let i = 0; i < events.length; i++) {
           const ev = events[i]
           const evYear = START_YEAR + ev.t * TOTAL_YEARS
@@ -1111,16 +1274,22 @@ export default function Scene() {
             : temporalDist < fadeStart ? 1.0
             : 1.0 - (temporalDist - fadeStart) / (evWindow - fadeStart)
 
+          // Project coil point
+          _projVec.set(sx, sy, sz).project(rt.camera)
+          if (_projVec.z > 1) continue
+          const coilX = (_projVec.x * 0.5 + 0.5) * sw
+          const coilY = (-_projVec.y * 0.5 + 0.5) * sh
+          if (coilX < -200 || coilX > sw + 200 || coilY < -50 || coilY > sh + 50) continue
+
+          // Project label anchor (offset from coil)
           const labelOff = viewDistForLevel(cameraLevel) * 0.08
-          const side = ev.level >= 3 ? 1 : -1 // day+ events on right, others on left
+          const side = ev.level >= 3 ? 1 : -1
           const ex = sx + side * labelOff * _camRight.x, ey = sy + side * labelOff * _camRight.y, ez = sz + side * labelOff * _camRight.z
           _projVec.set(ex, ey, ez).project(rt.camera)
-          if (_projVec.z > 1) continue
           const scrX = (_projVec.x * 0.5 + 0.5) * sw
           const scrY = (-_projVec.y * 0.5 + 0.5) * sh
-          if (scrX < -200 || scrX > sw + 200 || scrY < -50 || scrY > sh + 50) continue
 
-          eventLabels.push({ scrX, scrY, opacity, ev, anchorY: scrY, right: ev.level >= 3 })
+          eventLabels.push({ scrX, scrY, coilX, coilY, opacity, ev, anchorY: scrY, right: ev.level >= 3 })
         }
 
         // De-overlap: sort by screen Y, push overlapping labels downward
@@ -1138,7 +1307,9 @@ export default function Scene() {
         for (const lbl of eventLabels) {
           if (poolIdx >= POOL_SIZE) break
           const div = labelPool[poolIdx++]
-          div.textContent = lbl.ev.name
+          const dateStr = dateMode === 'relative' ? relativeDateStr(lbl.ev.t, params.focusT) : eventDateStr(lbl.ev.t)
+          const c = new THREE.Color(lbl.ev.color).lerp(new THREE.Color(1, 1, 1), 0.4)
+          div.innerHTML = `${lbl.ev.name} <span style="color:${c.getStyle()}">${dateStr}</span>`
           div.style.display = 'block'
           div.style.left = `${lbl.scrX}px`
           div.style.top = `${lbl.scrY}px`
@@ -1154,6 +1325,31 @@ export default function Scene() {
           div.dataset.eventLevel = String(lbl.ev.level)
         }
 
+        // ── Event connectors (dots on coil + lines to labels) ─────────────
+        {
+          const dpr = devicePixelRatio
+          const cw = Math.floor(sw * dpr), ch = Math.floor(sh * dpr)
+          if (connCanvas.width !== cw || connCanvas.height !== ch) {
+            connCanvas.width = cw; connCanvas.height = ch
+          }
+          const ctx = connCanvas.getContext('2d')!
+          ctx.clearRect(0, 0, cw, ch)
+          for (const lbl of eventLabels) {
+            if (lbl.opacity < 0.05) continue
+            const cx = lbl.coilX * dpr, cy = lbl.coilY * dpr
+            const lx = lbl.scrX * dpr, ly = lbl.scrY * dpr
+            ctx.globalAlpha = Math.max(0.3, lbl.opacity) * 0.5
+            // Connector line
+            ctx.strokeStyle = lbl.ev.color
+            ctx.lineWidth = 1 * dpr
+            ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(lx, ly); ctx.stroke()
+            // Dot on coil
+            ctx.fillStyle = lbl.ev.color
+            ctx.globalAlpha = Math.max(0.3, lbl.opacity)
+            ctx.beginPath(); ctx.arc(cx, cy, 3 * dpr, 0, Math.PI * 2); ctx.fill()
+          }
+          ctx.globalAlpha = 1
+        }
 
         // ── Focus indicator ────────────────────────────────────────────────
         {
