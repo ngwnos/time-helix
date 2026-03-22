@@ -7,14 +7,17 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "bun run build && wrangler dev",
+    "deploy": "bun run build && wrangler deploy"
   },
   "dependencies": {
+    "@cloudflare/vite-plugin": "^1.30.0",
     "@tweakpane/core": "^2.0.5",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "three": "^0.181.1",
-    "tweakpane": "^4.0.5"
+    "tweakpane": "^4.0.5",
+    "wrangler": "^4.76.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.6.0",
